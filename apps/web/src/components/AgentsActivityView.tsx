@@ -9,7 +9,6 @@ import {
   ChevronRight,
   Clock,
   Cpu,
-  Database,
   Globe,
   RefreshCw,
   Server,
@@ -152,6 +151,11 @@ export default function AgentsActivityView({ data, lang, onRefresh, onSelectRequ
           {isFr ? "Catalogue des Agents & Moteurs Actifs (6)" : "Active Agent Roster & Authority Engines (6)"}
         </h2>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {!data && (
+            <div className="col-span-full rounded-md border border-[#DEE4E9] bg-white p-6 text-center text-xs text-[#526170]">
+              {isFr ? "Chargement du statut des agents..." : "Loading live agent roster..."}
+            </div>
+          )}
           {(data?.agents || []).map((ag) => {
             const isRunning = ag.status === "running";
             const isDisabled = ag.status === "disabled_by_policy";
