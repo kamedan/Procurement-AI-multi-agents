@@ -1,0 +1,25 @@
+# Environment & secrets (NEVER commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Dependencies & build caches
+node_modules/
+apps/web/.next/
+apps/web/out/
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime artifacts
+tmp/
+logs/
+*.log
+.DS_Store
+Thumbs.db

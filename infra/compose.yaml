@@ -1,0 +1,240 @@
+name: procureai
+
+services:
+  db:
+    image: postgres:17.4-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-procureai}
+      POSTGRES_USER: ${POSTGRES_USER:-procureai_owner}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - procureai_pgdata:/var/lib/postgresql/data
+      - ./db/init-roles.sql:/docker-entrypoint-initdb.d/01-init-roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-procureai_owner} -d ${POSTGRES_DB:-procureai}"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    networks:
+      - internal
+
+  objectstore:
+    image: rustfs/rustfs@sha256:ee717072290bec9b11abfc0365f8310b00df1cd9b3639943edae47bdef05044a
+    restart: unless-stopped
+    security_opt:
+      - "no-new-privileges:true"
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ENABLE: "false"
+      RUSTFS_ACCESS_KEY: ${OBJECTSTORE_ROOT_USER:-procureai_storage}
+      RUSTFS_SECRET_KEY: ${OBJECTSTORE_ROOT_PASSWORD:?OBJECTSTORE_ROOT_PASSWORD is required}
+    volumes:
+      - procureai_objects:/data
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -fsS http://127.0.0.1:9000/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+    networks:
+      - internal
+
+  objectstore-init:
+    build:
+      context: ..
+      dockerfile: infra/docker/python.Dockerfile
+    image: procureai-python:local
+    depends_on:
+      objectstore:
+        condition: service_healthy
+    environment:
+      OBJECTSTORE_ENDPOINT: ${OBJECTSTORE_ENDPOINT:-http://objectstore:9000}
+      OBJECTSTORE_ROOT_USER: ${OBJECTSTORE_ROOT_USER:-procureai_storage}
+      OBJECTSTORE_ROOT_PASSWORD: ${OBJECTSTORE_ROOT_PASSWORD:?OBJECTSTORE_ROOT_PASSWORD is required}
+      OBJECTSTORE_BUCKET: ${OBJECTSTORE_BUCKET:-procureai-private-documents}
+      OBJECTSTORE_REGION: ${OBJECTSTORE_REGION:-us-east-1}
+    command: ["python", "-m", "app.init_storage"]
+    restart: "no"
+    networks:
+      - internal
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: infra/docker/python.Dockerfile
+    image: procureai-python:local
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PROCUREAI_ENV: ${PROCUREAI_ENV:-development}
+      DATABASE_OWNER_URL: postgresql+psycopg://${POSTGRES_USER:-procureai_owner}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-procureai}
+      DATABASE_CHECKPOINT_OWNER_URL: postgresql://${POSTGRES_USER:-procureai_owner}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-procureai}?options=-c%20search_path%3Dlanggraph_checkpoints
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-procureai_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}
+    command: ["python", "-m", "app.migrate"]
+    restart: "no"
+    networks:
+      - internal
+
+  api:
+    build:
+      context: ..
+      dockerfile: infra/docker/python.Dockerfile
+    image: procureai-python:local
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      objectstore-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      PROCUREAI_ENV: ${PROCUREAI_ENV:-development}
+      PROCUREAI_DEV_AUTH_ENABLED: ${PROCUREAI_DEV_AUTH_ENABLED:-true}
+      PROCUREAI_SESSION_SECRET: ${PROCUREAI_SESSION_SECRET:?PROCUREAI_SESSION_SECRET is required}
+      DATABASE_APP_URL: postgresql+psycopg://${POSTGRES_APP_USER:-procureai_app}:${POSTGRES_APP_PASSWORD}@db:5432/${POSTGRES_DB:-procureai}
+      DATABASE_CHECKPOINT_URL: postgresql://${POSTGRES_APP_USER:-procureai_app}:${POSTGRES_APP_PASSWORD}@db:5432/${POSTGRES_DB:-procureai}?options=-c%20search_path%3Dlanggraph_checkpoints
+      OBJECTSTORE_ENDPOINT: ${OBJECTSTORE_ENDPOINT:-http://objectstore:9000}
+      OBJECTSTORE_ROOT_USER: ${OBJECTSTORE_ROOT_USER:-procureai_storage}
+      OBJECTSTORE_ROOT_PASSWORD: ${OBJECTSTORE_ROOT_PASSWORD}
+      OBJECTSTORE_BUCKET: ${OBJECTSTORE_BUCKET:-procureai-private-documents}
+      OBJECTSTORE_REGION: ${OBJECTSTORE_REGION:-us-east-1}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_APP_URL: ${OPENROUTER_APP_URL:-http://localhost:3000}
+      OPENROUTER_APP_TITLE: ${OPENROUTER_APP_TITLE:-ProcureAI}
+      OPENROUTER_MODEL_EXTRACTION: ${OPENROUTER_MODEL_EXTRACTION:-deepseek/deepseek-v4.1-flash}
+      OPENROUTER_MODEL_DECISION: ${OPENROUTER_MODEL_DECISION:-typesafe/jev-router}
+      OPENROUTER_MODEL_REASONING: ${OPENROUTER_MODEL_REASONING:-typesafe/jev-router}
+      OPENROUTER_MODEL_VISION: ${OPENROUTER_MODEL_VISION:-deepseek/deepseek-v4.1-flash}
+      OPENROUTER_MODEL_FALLBACK: ${OPENROUTER_MODEL_FALLBACK:-deepseek/deepseek-v4.1-flash}
+      OPENROUTER_JEV_MAX_PROMPT_USD_PER_M: ${OPENROUTER_JEV_MAX_PROMPT_USD_PER_M:-0.50}
+      OPENROUTER_JEV_MAX_COMPLETION_USD_PER_M: ${OPENROUTER_JEV_MAX_COMPLETION_USD_PER_M:-1.50}
+      OPENROUTER_DATA_COLLECTION: ${OPENROUTER_DATA_COLLECTION:-deny}
+      OPENROUTER_REQUIRE_ZDR: ${OPENROUTER_REQUIRE_ZDR:-true}
+      OPENROUTER_REQUIRE_PARAMETERS: ${OPENROUTER_REQUIRE_PARAMETERS:-true}
+      OPENROUTER_MAX_RETRIES: ${OPENROUTER_MAX_RETRIES:-2}
+      OPENROUTER_TIMEOUT_SECONDS: ${OPENROUTER_TIMEOUT_SECONDS:-45}
+      PROCUREAI_TENANT_DAILY_AI_BUDGET_USD: ${PROCUREAI_TENANT_DAILY_AI_BUDGET_USD:-5.00}
+      PROCUREAI_LLM_CACHE_TTL_SECONDS: ${PROCUREAI_LLM_CACHE_TTL_SECONDS:-86400}
+      PROCUREAI_EXTERNAL_SEARCH_ENABLED: ${PROCUREAI_EXTERNAL_SEARCH_ENABLED:-true}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      PROCUREAI_TAVILY_COST_PER_CREDIT_USD: ${PROCUREAI_TAVILY_COST_PER_CREDIT_USD:-0.008000}
+      PROCUREAI_TAVILY_CACHE_TTL_SECONDS: ${PROCUREAI_TAVILY_CACHE_TTL_SECONDS:-43200}
+      PROCUREAI_SMTP_HOST: ${PROCUREAI_SMTP_HOST:-}
+      PROCUREAI_SMTP_PORT: ${PROCUREAI_SMTP_PORT:-587}
+      PROCUREAI_SMTP_USER: ${PROCUREAI_SMTP_USER:-}
+      PROCUREAI_SMTP_PASSWORD: ${PROCUREAI_SMTP_PASSWORD:-}
+      PROCUREAI_SMTP_FROM_EMAIL: ${PROCUREAI_SMTP_FROM_EMAIL:-}
+      PROCUREAI_SMTP_USE_TLS: ${PROCUREAI_SMTP_USE_TLS:-true}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+
+  worker:
+    build:
+      context: ..
+      dockerfile: infra/docker/python.Dockerfile
+    image: procureai-python:local
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      db:
+        condition: service_healthy
+      objectstore-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    command: ["python", "-m", "app.worker"]
+    environment:
+      PROCUREAI_ENV: ${PROCUREAI_ENV:-development}
+      PROCUREAI_SESSION_SECRET: ${PROCUREAI_SESSION_SECRET:?PROCUREAI_SESSION_SECRET is required}
+      DATABASE_APP_URL: postgresql+psycopg://${POSTGRES_APP_USER:-procureai_app}:${POSTGRES_APP_PASSWORD}@db:5432/${POSTGRES_DB:-procureai}
+      DATABASE_CHECKPOINT_URL: postgresql://${POSTGRES_APP_USER:-procureai_app}:${POSTGRES_APP_PASSWORD}@db:5432/${POSTGRES_DB:-procureai}?options=-c%20search_path%3Dlanggraph_checkpoints
+      OBJECTSTORE_ENDPOINT: ${OBJECTSTORE_ENDPOINT:-http://objectstore:9000}
+      OBJECTSTORE_ROOT_USER: ${OBJECTSTORE_ROOT_USER:-procureai_storage}
+      OBJECTSTORE_ROOT_PASSWORD: ${OBJECTSTORE_ROOT_PASSWORD}
+      OBJECTSTORE_BUCKET: ${OBJECTSTORE_BUCKET:-procureai-private-documents}
+      OBJECTSTORE_REGION: ${OBJECTSTORE_REGION:-us-east-1}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_APP_URL: ${OPENROUTER_APP_URL:-http://localhost:3000}
+      OPENROUTER_APP_TITLE: ${OPENROUTER_APP_TITLE:-ProcureAI}
+      OPENROUTER_MODEL_EXTRACTION: ${OPENROUTER_MODEL_EXTRACTION:-deepseek/deepseek-v4.1-flash}
+      OPENROUTER_MODEL_DECISION: ${OPENROUTER_MODEL_DECISION:-typesafe/jev-router}
+      OPENROUTER_MODEL_REASONING: ${OPENROUTER_MODEL_REASONING:-typesafe/jev-router}
+      OPENROUTER_MODEL_VISION: ${OPENROUTER_MODEL_VISION:-deepseek/deepseek-v4.1-flash}
+      OPENROUTER_MODEL_FALLBACK: ${OPENROUTER_MODEL_FALLBACK:-deepseek/deepseek-v4.1-flash}
+      OPENROUTER_JEV_MAX_PROMPT_USD_PER_M: ${OPENROUTER_JEV_MAX_PROMPT_USD_PER_M:-0.50}
+      OPENROUTER_JEV_MAX_COMPLETION_USD_PER_M: ${OPENROUTER_JEV_MAX_COMPLETION_USD_PER_M:-1.50}
+      OPENROUTER_DATA_COLLECTION: ${OPENROUTER_DATA_COLLECTION:-deny}
+      OPENROUTER_REQUIRE_ZDR: ${OPENROUTER_REQUIRE_ZDR:-true}
+      OPENROUTER_REQUIRE_PARAMETERS: ${OPENROUTER_REQUIRE_PARAMETERS:-true}
+      OPENROUTER_MAX_RETRIES: ${OPENROUTER_MAX_RETRIES:-2}
+      OPENROUTER_TIMEOUT_SECONDS: ${OPENROUTER_TIMEOUT_SECONDS:-45}
+      PROCUREAI_TENANT_DAILY_AI_BUDGET_USD: ${PROCUREAI_TENANT_DAILY_AI_BUDGET_USD:-5.00}
+      PROCUREAI_LLM_CACHE_TTL_SECONDS: ${PROCUREAI_LLM_CACHE_TTL_SECONDS:-86400}
+      PROCUREAI_EXTERNAL_SEARCH_ENABLED: ${PROCUREAI_EXTERNAL_SEARCH_ENABLED:-true}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      PROCUREAI_TAVILY_COST_PER_CREDIT_USD: ${PROCUREAI_TAVILY_COST_PER_CREDIT_USD:-0.008000}
+      PROCUREAI_TAVILY_CACHE_TTL_SECONDS: ${PROCUREAI_TAVILY_CACHE_TTL_SECONDS:-43200}
+      PROCUREAI_SMTP_HOST: ${PROCUREAI_SMTP_HOST:-}
+      PROCUREAI_SMTP_PORT: ${PROCUREAI_SMTP_PORT:-587}
+      PROCUREAI_SMTP_USER: ${PROCUREAI_SMTP_USER:-}
+      PROCUREAI_SMTP_PASSWORD: ${PROCUREAI_SMTP_PASSWORD:-}
+      PROCUREAI_SMTP_FROM_EMAIL: ${PROCUREAI_SMTP_FROM_EMAIL:-}
+      PROCUREAI_SMTP_USE_TLS: ${PROCUREAI_SMTP_USE_TLS:-true}
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.worker_health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    networks:
+      - internal
+
+  web:
+    build:
+      context: ..
+      dockerfile: infra/docker/web.Dockerfile
+      args:
+        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+    image: procureai-web:local
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PROCUREAI_ENV: ${PROCUREAI_ENV:-development}
+      PROCUREAI_DEV_AUTH_ENABLED: ${PROCUREAI_DEV_AUTH_ENABLED:-true}
+      PROCUREAI_SESSION_SECRET: ${PROCUREAI_SESSION_SECRET:?PROCUREAI_SESSION_SECRET is required}
+      API_INTERNAL_URL: ${API_INTERNAL_URL:-http://api:8000}
+      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+      - public
+
+volumes:
+  procureai_pgdata:
+  procureai_objects:
+
+networks:
+  internal:
+    driver: bridge
+  public:
+    driver: bridge

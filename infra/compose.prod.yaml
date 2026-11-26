@@ -1,0 +1,41 @@
+# Production-oriented self-hosted Compose reference:
+#   docker compose -f infra/compose.yaml -f infra/compose.prod.yaml up -d
+# - Disables dev auth adapter unconditionally
+# - Removes host port publication for PostgreSQL
+# - Uses file-mounted secrets for OPENROUTER_API_KEY and PROCUREAI_SESSION_SECRET
+
+services:
+  api:
+    environment:
+      PROCUREAI_ENV: production
+      PROCUREAI_DEV_AUTH_ENABLED: "false"
+      OPENROUTER_API_KEY: ""
+      OPENROUTER_API_KEY_FILE: /run/secrets/openrouter_api_key
+      PROCUREAI_SESSION_SECRET_FILE: /run/secrets/session_secret
+    secrets:
+      - openrouter_api_key
+      - session_secret
+
+  worker:
+    environment:
+      PROCUREAI_ENV: production
+      OPENROUTER_API_KEY: ""
+      OPENROUTER_API_KEY_FILE: /run/secrets/openrouter_api_key
+      PROCUREAI_SESSION_SECRET_FILE: /run/secrets/session_secret
+    secrets:
+      - openrouter_api_key
+      - session_secret
+
+  web:
+    environment:
+      PROCUREAI_ENV: production
+      PROCUREAI_DEV_AUTH_ENABLED: "false"
+      PROCUREAI_SESSION_SECRET_FILE: /run/secrets/session_secret
+    secrets:
+      - session_secret
+
+secrets:
+  openrouter_api_key:
+    file: ../secrets/openrouter_api_key.txt
+  session_secret:
+    file: ../secrets/session_secret.txt
