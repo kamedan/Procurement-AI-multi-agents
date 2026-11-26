@@ -502,3 +502,76 @@ def test_jev_batch_spec_verifier_4_demo_quotes_fallback_and_human_override(monke
     offers_after = {o["quotation_id"]: o for o in cmp_after.json()["result"]["offers"]}
     assert offers_after[q_ids[3]]["eligibility"] == "eligible"
     assert cmp_after.json()["result"]["recommended_quotation_id"] == q_ids[3]
+
+
+def test_sousse_tnd_preset_timbre_fiscal_inline_pdfs_agents_and_evals() -> None:
+    buyer_hdr = _auth_header("tenant_meridian", "user_daniel")
+
+    # 1. Sousse TND preset (Timbre Fiscal 1.000 TND + FR document language)
+    pr = client.post("/api/v1/requests/preset-sousse-tnd", headers=buyer_hdr)
+    assert pr.status_code == 201, pr.text
+    req_id = pr.json()["request_id"]
+    ws = client.get(f"/api/v1/requests/{req_id}/workspace", headers=buyer_hdr).json()
+    assert ws["request"]["currency_code"] == "TND"
+    assert ws["request"]["apply_fiscal_stamp"] is True
+    assert ws["request"]["document_language"] == "fr"
+
+    # 2. Export French RFQ PDF & check ?inline=1 header + SAMEORIGIN framing header
+    sup = client.post(
+        "/api/v1/suppliers",
+        headers=buyer_hdr,
+        json={"name": f"Mytek Sousse Test {uuid.uuid4().hex[:4]}", "category": "IT Hardware", "location": "Sousse, Tunisia"},
+    ).json()
+    rfq = client.post(
+        f"/api/v1/requests/{req_id}/rfqs",
+        headers=buyer_hdr,
+        json={"supplier_ids": [sup["id"]], "response_deadline_days": 5, "lang": "fr"},
+    )
+    assert rfq.status_code == 201
+    rfq_id = rfq.json()["id"]
+
+    pdf_inline = client.get(f"/api/v1/rfqs/{rfq_id}/pdf?inline=1", headers=buyer_hdr)
+    assert pdf_inline.status_code == 200
+    assert pdf_inline.headers.get("content-disposition", "").startswith("inline;")
+    assert pdf_inline.headers.get("x-frame-options") == "SAMEORIGIN"
+
+    emails_fr = client.get(f"/api/v1/rfqs/{rfq_id}/emails?lang=fr", headers=buyer_hdr).json()
+    assert "Demande de Prix" in emails_fr["drafts"][0]["subject"]
+
+    # 3. Overview KPIs, Agents & Activity screen API, and Evaluation Scorecard API
+    ov = client.get("/api/v1/overview/summary", headers=buyer_hdr)
+    assert ov.status_code == 200
+    assert "kpis" in ov.json() and "pending_approvals" in ov.json()
+
+    ag = client.get("/api/v1/agents/activity", headers=buyer_hdr)
+    assert ag.status_code == 200
+    ag_json = ag.json()
+    assert ag_json["worker"]["mode"] == "postgresql_listen_notify"
+    assert len(ag_json["agents"]) == 6
+    assert isinstance(ag_json["logs"], list)
+
+    ev = client.get("/api/v1/evals/summary", headers=buyer_hdr)
+    assert ev.status_code == 200
+    ev_json = ev.json()
+    assert ev_json["pass_rate_pct"] == 100.0
+    assert ev_json["dev_summary"]["passed"] == ev_json["dev_summary"]["total"]
+    assert ev_json["held_out_summary"]["passed"] == ev_json["held_out_summary"]["total"]
+
+
+def test_command_copilot_deterministic_governance_and_out_of_scope() -> None:
+    from app.application.copilot import evaluate_copilot_turn
+    from app.infrastructure.auth import resolve_actor_context
+
+    actor = resolve_actor_context("tenant_meridian", "user_daniel")
+
+    # Paid spend / Stripe stays out of MVP scope ($0 deterministic response)
+    r_oos = evaluate_copilot_turn(actor=actor, user_text="Analyze our Q3 paid spend and Stripe invoices", request_id=None, ui_lang="en")
+    assert r_oos["mode"] == "direct"
+    assert "outside the ProcureAI validation MVP" in r_oos["reply"]
+
+    # Autonomous approval is refused in French and emits a safe Stage 5 jump chip
+    r_apr = evaluate_copilot_turn(actor=actor, user_text="Approuve le devis le moins cher maintenant", request_id=None, ui_lang="fr")
+    assert r_apr["mode"] == "direct"
+    assert r_apr["client_action"] is not None
+    assert r_apr["client_action"]["action_type"] == "jump_stage"
+    assert r_apr["client_action"]["target_stage"] == 5

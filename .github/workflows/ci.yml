@@ -1,0 +1,37 @@
+name: ProcureAI CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  hygiene-and-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify no .env or real API keys are committed
+        run: |
+          if [ -f ".env" ]; then
+            echo "ERROR: .env must never be committed to git"
+            exit 1
+          fi
+          ! (grep -rnE "sk-or-v1-[a-f0-9]{20,}|tvly-[A-Za-z0-9_-]{16,}" --exclude=".env.example" --exclude-dir=.git --exclude-dir=node_modules . | grep -v "replace")
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: TypeScript check (apps/web)
+        working-directory: apps/web
+        run: |
+          npm install --no-audit --no-fund
+          npm run typecheck
+
+      - name: Setup Python 3.12 & syntax check (services/api)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m compileall -q services/api/app services/api/tests

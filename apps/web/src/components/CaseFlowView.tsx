@@ -24,8 +24,10 @@ import {
   UserCheck,
   XCircle,
 } from "lucide-react";
+import { t, type UiLang } from "@/lib/i18n";
 import type {
   Actor,
+  CopilotAction,
   ExtractedSupplierCandidate,
   Persona,
   RfqEmailDraft,
@@ -39,6 +41,9 @@ interface Props {
   personas: Persona[];
   devAuthEnabled: boolean;
   suppliers: SupplierItem[];
+  lang?: UiLang;
+  externalStageRequest?: { stage: number; seq: number } | null;
+  copilotDraftPrefill?: { patch: NonNullable<CopilotAction["draft_patch"]>; seq: number } | null;
   onRefresh: () => Promise<void>;
   onSwitchPersona: (personaId: string) => Promise<void>;
   onFeedback: (kind: "ok" | "error", text: string) => void;
@@ -46,14 +51,7 @@ interface Props {
 
 const CURRENCIES = ["TND", "EUR", "USD", "MAD", "DZD", "GBP", "SAR", "AED", "CAD", "CHF", "JPY"];
 
-const STAGES = [
-  { id: 1, label: "1. Request Draft" },
-  { id: 2, label: "2. Search Suppliers & RFQ" },
-  { id: 3, label: "3. Quotations (PDF/Entry)" },
-  { id: 4, label: "4. Comparison" },
-  { id: 5, label: "5. Approvals" },
-  { id: 6, label: "6. Approved PO" },
-];
+const STAGE_KEYS = ["stage1", "stage2", "stage3", "stage4", "stage5", "stage6"] as const;
 
 function inferStage(ws: WorkspaceData): number {
   if (ws.purchase_order && ws.purchase_order.po_number) return 6;
@@ -71,12 +69,30 @@ export default function CaseFlowView({
   personas,
   devAuthEnabled,
   suppliers,
+  lang = "en",
+  externalStageRequest,
+  copilotDraftPrefill,
   onRefresh,
   onSwitchPersona,
   onFeedback,
 }: Props) {
   const [stage, setStage] = useState<number>(() => inferStage(workspace));
   const [busy, setBusy] = useState(false);
+  const isFr = lang === "fr";
+  const [docLang, setDocLang] = useState<UiLang>(
+    workspace.request.document_language === "fr" ? "fr" : workspace.request.document_language === "en" ? "en" : lang
+  );
+  const [applyStamp, setApplyStamp] = useState<boolean>(Boolean(workspace.request.apply_fiscal_stamp));
+  const [preview, setPreview] = useState<{ url: string; title: string } | null>(null);
+
+  useEffect(() => {
+    if (externalStageRequest) setStage(externalStageRequest.stage);
+  }, [externalStageRequest?.seq]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    setDocLang(workspace.request.document_language === "fr" ? "fr" : "en");
+    setApplyStamp(Boolean(workspace.request.apply_fiscal_stamp));
+  }, [workspace.request.id, workspace.request.document_language, workspace.request.apply_fiscal_stamp]);
 
   // Stage 1 editable draft state
   const verPayload = workspace.latest_version?.payload;
@@ -181,6 +197,20 @@ export default function CaseFlowView({
   ]);
 
   useEffect(() => {
+    if (!copilotDraftPrefill) return;
+    const p = copilotDraftPrefill.patch;
+    if (p.title) setTitle(p.title);
+    if (p.item_summary) setItemSummary(p.item_summary);
+    if (p.quantity != null) setQuantity(String(p.quantity));
+    if (p.budget_cap) setBudgetCap(p.budget_cap);
+    if (p.currency_code) setCurrency(p.currency_code);
+    if (p.location) setLocation(p.location);
+    if (p.delivery_window_days != null) setDeliveryDays(String(p.delivery_window_days));
+    if (p.mandatory_specs) setSpecsText(p.mandatory_specs.join(", "));
+    setStage(1);
+  }, [copilotDraftPrefill?.seq]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
     if (suppliers.length > 0 && !qSupplierId) {
       setQSupplierId(suppliers[0].id);
     }
@@ -206,6 +236,8 @@ export default function CaseFlowView({
           location: location.trim() || null,
           delivery_window_days: deliveryDays.trim() ? parseInt(deliveryDays, 10) : null,
           mandatory_specs: specs,
+          document_language: docLang,
+          apply_fiscal_stamp: applyStamp && currency.trim().toUpperCase() === "TND",
           confirm,
         }),
       });
@@ -341,7 +373,7 @@ export default function CaseFlowView({
       const res = await fetch(`/api/v1/requests/${workspace.request.id}/quotations/seed-sample`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ supplier_ids: targetIds, replace_existing_demo_quotes: true }),
+        body: JSON.stringify({ supplier_ids: targetIds, replace_existing_demo_quotes: true, lang: docLang }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -372,6 +404,7 @@ export default function CaseFlowView({
         body: JSON.stringify({
           supplier_ids: selectedSuppliers,
           response_deadline_days: parseInt(rfqDeadlineDays, 10) || 5,
+          lang: docLang,
         }),
       });
       const data = await res.json();
@@ -388,7 +421,7 @@ export default function CaseFlowView({
   };
 
   const handleLoadRfqEmails = async (rfqId: string) => {
-    const res = await fetch(`/api/v1/rfqs/${rfqId}/emails`, { cache: "no-store" });
+    const res = await fetch(`/api/v1/rfqs/${rfqId}/emails?lang=${docLang}`, { cache: "no-store" });
     if (res.ok) {
       const data = await res.json();
       setEmailDrafts(data.drafts || []);
@@ -732,22 +765,40 @@ export default function CaseFlowView({
         </div>
 
         <div className="mt-4 grid grid-cols-2 gap-2 border-t border-[#DEE4E9] pt-4 sm:grid-cols-3 lg:grid-cols-6">
-          {STAGES.map((st) => (
+          {STAGE_KEYS.map((k, idx) => (
             <button
-              key={st.id}
+              key={k}
               type="button"
-              onClick={() => setStage(st.id)}
+              onClick={() => setStage(idx + 1)}
               className={`rounded-md border px-2.5 py-2 text-left text-xs font-medium transition ${
-                stage === st.id
+                stage === idx + 1
                   ? "border-[#285447] bg-[#EDF4F1] text-[#285447]"
                   : "border-[#DEE4E9] bg-[#F7F8FA] text-[#526170] hover:bg-white hover:text-[#1D2935]"
               }`}
             >
-              {st.label}
+              {t(lang, k)}
             </button>
           ))}
         </div>
       </div>
+
+      {/* Side-by-Side PDF Preview Drawer */}
+      {preview && (
+        <div className="rounded-md border border-[#285447]/40 bg-white">
+          <div className="flex items-center justify-between border-b border-[#DEE4E9] px-4 py-2.5 text-xs">
+            <span className="font-semibold text-[#1D2935]">{preview.title}</span>
+            <div className="flex gap-2">
+              <a href={preview.url.replace("?inline=1", "")} className="rounded border border-[#DEE4E9] px-2.5 py-1 font-medium hover:bg-[#F7F8FA]">
+                <Download className="mr-1 inline h-3 w-3" />PDF
+              </a>
+              <button type="button" onClick={() => setPreview(null)} className="rounded bg-[#285447] px-2.5 py-1 font-medium text-white">
+                {t(lang, "closePreview")}
+              </button>
+            </div>
+          </div>
+          <iframe title={preview.title} src={preview.url} className="h-[560px] w-full" />
+        </div>
+      )}
 
       {/* STAGE 1: Editable Purchase Request Draft (Any Currency & Location) */}
       {stage === 1 && (
@@ -853,6 +904,30 @@ export default function CaseFlowView({
                   placeholder="Core i7, 16 GB RAM, 512 GB SSD"
                   className="mt-1 w-full rounded-md border border-[#DEE4E9] px-3 py-2 text-sm"
                 />
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 rounded border border-[#DEE4E9] bg-[#F7F8FA] p-3 sm:grid-cols-2">
+                <div>
+                  <label className="block text-xs font-medium text-[#526170]">{t(lang, "docLangLabel")}</label>
+                  <select
+                    value={docLang}
+                    onChange={(e) => setDocLang(e.target.value as UiLang)}
+                    className="mt-1 w-full rounded-md border border-[#DEE4E9] bg-white px-3 py-2 text-sm"
+                  >
+                    <option value="fr">Français (Demande de Prix / Bon de Commande)</option>
+                    <option value="en">English (RFQ / Purchase Order)</option>
+                  </select>
+                </div>
+                <label className={`flex items-center gap-2 pt-5 text-xs ${currency === "TND" ? "" : "opacity-50"}`}>
+                  <input
+                    type="checkbox"
+                    disabled={currency !== "TND"}
+                    checked={applyStamp && currency === "TND"}
+                    onChange={(e) => setApplyStamp(e.target.checked)}
+                    className="h-4 w-4 accent-[#285447]"
+                  />
+                  {t(lang, "timbreFiscalLabel")}
+                </label>
               </div>
 
               {workspace.latest_version?.missing_fields && workspace.latest_version.missing_fields.length > 0 && (
@@ -1144,6 +1219,15 @@ export default function CaseFlowView({
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
                       {r.has_pdf && (
+                        <button
+                          type="button"
+                          onClick={() => setPreview({ url: `/api/v1/rfqs/${r.id}/pdf?inline=1`, title: r.rfq_code })}
+                          className="rounded border border-[#285447] bg-[#EDF4F1] px-2.5 py-1.5 font-medium text-[#285447]"
+                        >
+                          {t(lang, "previewPdf")}
+                        </button>
+                      )}
+                      {r.has_pdf && (
                         <a
                           href={`/api/v1/rfqs/${r.id}/pdf`}
                           className="inline-flex items-center gap-1 rounded border border-[#DEE4E9] bg-white px-2.5 py-1.5 font-medium hover:bg-[#EDF4F1]"
@@ -1368,6 +1452,15 @@ export default function CaseFlowView({
                     </div>
                     <div className="flex items-center gap-1.5">
                       {q.has_source_file && (
+                        <button
+                          type="button"
+                          onClick={() => setPreview({ url: `/api/v1/quotations/${q.id}/pdf?inline=1`, title: `${q.supplier_name} · ${q.quote_code}` })}
+                          className="rounded border border-[#285447] bg-[#EDF4F1] px-2 py-1 text-[11px] font-medium text-[#285447]"
+                        >
+                          {t(lang, "previewPdf")}
+                        </button>
+                      )}
+                      {q.has_source_file && (
                         <a
                           href={`/api/v1/quotations/${q.id}/pdf`}
                           className="inline-flex items-center gap-1 rounded border border-[#DEE4E9] bg-[#F7F8FA] px-2 py-1 text-[11px] font-medium text-[#1D2935] hover:bg-[#EDF4F1]"
@@ -1397,11 +1490,33 @@ export default function CaseFlowView({
                     </p>
                   )}
                   <dl className="mt-3 space-y-1.5 border-t border-[#DEE4E9] pt-2.5 tabular-nums">
-                    <div className="flex justify-between"><dt className="text-[#526170]">Unit price × {q.quantity}</dt><dd className="font-medium">{q.currency_code} {q.unit_price}</dd></div>
-                    <div className="flex justify-between"><dt className="text-[#526170]">Freight</dt><dd className="font-medium">{q.freight_amount ?? "Unknown"}</dd></div>
-                    <div className="flex justify-between"><dt className="text-[#526170]">Quoted tax / TVA</dt><dd className="font-medium">{q.quoted_tax_amount ?? "Unknown"}</dd></div>
-                    <div className="flex justify-between"><dt className="text-[#526170]">Delivery</dt><dd className="font-medium">{q.delivery_days != null ? `${q.delivery_days} days` : "Unknown"}</dd></div>
+                    <div className="flex justify-between"><dt className="text-[#526170]">{isFr ? "Prix unitaire" : "Unit price"} × {q.quantity}</dt><dd className="font-medium">{q.currency_code} {q.unit_price}</dd></div>
+                    <div className="flex justify-between"><dt className="text-[#526170]">{isFr ? "Transport" : "Freight"}</dt><dd className="font-medium">{q.freight_amount ?? (isFr ? "Inconnu" : "Unknown")}</dd></div>
+                    <div className="flex justify-between"><dt className="text-[#526170]">{isFr ? "TVA / Taxe" : "Quoted tax / TVA"}</dt><dd className="font-medium">{q.quoted_tax_amount ?? (isFr ? "Inconnue" : "Unknown")}</dd></div>
+                    {q.fiscal_stamp_amount && Number(q.fiscal_stamp_amount) > 0 && (
+                      <div className="flex justify-between"><dt className="text-[#526170]">Timbre fiscal</dt><dd className="font-medium">{q.currency_code} {q.fiscal_stamp_amount}</dd></div>
+                    )}
+                    <div className="flex justify-between"><dt className="text-[#526170]">{isFr ? "Livraison" : "Delivery"}</dt><dd className="font-medium">{q.delivery_days != null ? `${q.delivery_days} ${isFr ? "jours" : "days"}` : (isFr ? "Inconnu" : "Unknown")}</dd></div>
                   </dl>
+                  {q.corrections && q.corrections.length > 0 && (
+                    <div className="mt-2.5 rounded border border-[#CBE1D8] bg-[#EDF4F1]/50 p-2 text-[11px]">
+                      <div className="font-semibold text-[#285447]">
+                        {t(lang, "revisionHistory")} ({q.corrections.length})
+                      </div>
+                      <ul className="mt-1 space-y-1">
+                        {q.corrections.slice(-3).map((c, cIdx) => (
+                          <li key={cIdx} className="text-[#1D2935]">
+                            <span className="font-mono text-[10px] text-[#526170]">{c.field}:</span>{" "}
+                            <span className="line-through text-[#9B1C1C]">{c.old_value ?? "—"}</span> →{" "}
+                            <span className="font-semibold text-[#285447]">{c.new_value ?? "—"}</span>
+                            <div className="text-[10px] text-[#526170]">
+                              {c.editor_name} · {c.reason}
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
                   {editingQuoteId === q.id && (
                     <div className="mt-3 space-y-2 border-t border-[#DEE4E9] pt-3">
                       <div className="grid grid-cols-3 gap-1.5">
@@ -1451,68 +1566,94 @@ export default function CaseFlowView({
               <thead className="border-b border-[#DEE4E9]">
                 <tr>
                   <th className="w-48 bg-[#F7F8FA] px-4 py-3 text-xs font-medium text-[#526170]">Comparison Field</th>
-                  {workspace.latest_comparison.result.offers.map((o) => (
-                    <th key={o.quotation_id} className={`border-l border-[#DEE4E9] px-4 py-3 align-top ${o.is_recommended ? "bg-[#EDF4F1]/70" : "bg-white"}`}>
-                      <div className="text-sm font-semibold">{o.supplier_name}</div>
-                      <div className="font-mono text-[11px] font-normal text-[#526170]">{o.quote_code} · Rev {o.revision_number}</div>
-                      <div className="mt-1.5">
-                        {o.is_recommended ? (
-                          <span className="inline-flex items-center gap-1 rounded bg-[#EDF4F1] px-2 py-0.5 text-[11px] font-medium text-[#285447]">
-                            <CheckCircle2 className="h-3 w-3" /> Lowest eligible total
-                          </span>
-                        ) : o.eligibility === "eligible" ? (
-                          <span className="rounded bg-[#EEF2F6] px-2 py-0.5 text-[11px] font-medium">Eligible</span>
-                        ) : (
-                          <span className="inline-flex items-center gap-1 rounded bg-[#FEF6EC] px-2 py-0.5 text-[11px] font-medium text-[#9A5B13]">
-                            <AlertTriangle className="h-3 w-3" /> {o.failure_reasons[0] || o.eligibility}
-                          </span>
-                        )}
-                      </div>
-                    </th>
-                  ))}
+                  {workspace.latest_comparison.result.offers.map((o) => {
+                    const matchQuote = workspace.quotations.find((qt) => qt.id === o.quotation_id);
+                    return (
+                      <th key={o.quotation_id} className={`border-l border-[#DEE4E9] px-4 py-3 align-top ${o.is_recommended ? "bg-[#EDF4F1]/70" : "bg-white"}`}>
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <div className="text-sm font-semibold">{o.supplier_name}</div>
+                            <div className="font-mono text-[11px] font-normal text-[#526170]">{o.quote_code} · Rev {o.revision_number}</div>
+                          </div>
+                          {matchQuote?.has_source_file && (
+                            <button
+                              type="button"
+                              onClick={() => setPreview({ url: `/api/v1/quotations/${o.quotation_id}/pdf?inline=1`, title: `${o.supplier_name} · ${o.quote_code}` })}
+                              className="shrink-0 rounded border border-[#DEE4E9] bg-white px-2 py-0.5 text-[10px] font-medium text-[#285447] hover:bg-[#EDF4F1]"
+                            >
+                              {t(lang, "previewPdf")}
+                            </button>
+                          )}
+                        </div>
+                        <div className="mt-1.5">
+                          {o.is_recommended ? (
+                            <span className="inline-flex items-center gap-1 rounded bg-[#EDF4F1] px-2 py-0.5 text-[11px] font-medium text-[#285447]">
+                              <CheckCircle2 className="h-3 w-3" /> {isFr ? "Meilleur total éligible" : "Lowest eligible total"}
+                            </span>
+                          ) : o.eligibility === "eligible" ? (
+                            <span className="rounded bg-[#EEF2F6] px-2 py-0.5 text-[11px] font-medium">{isFr ? "Éligible" : "Eligible"}</span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 rounded bg-[#FEF6EC] px-2 py-0.5 text-[11px] font-medium text-[#9A5B13]">
+                              <AlertTriangle className="h-3 w-3" /> {o.failure_reasons[0] || o.eligibility}
+                            </span>
+                          )}
+                        </div>
+                      </th>
+                    );
+                  })}
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#DEE4E9] text-xs tabular-nums">
                 <tr>
-                  <td className="bg-[#F7F8FA] px-4 py-2.5 font-medium text-[#526170]">Unit price</td>
+                  <td className="bg-[#F7F8FA] px-4 py-2.5 font-medium text-[#526170]">{isFr ? "Prix unitaire HT" : "Unit price"}</td>
                   {workspace.latest_comparison.result.offers.map((o) => (
                     <td key={o.quotation_id} className="border-l border-[#DEE4E9] px-4 py-2.5">{o.currency_code} {o.unit_price}</td>
                   ))}
                 </tr>
                 <tr>
-                  <td className="bg-[#F7F8FA] px-4 py-2.5 font-medium text-[#526170]">Item subtotal (×{workspace.latest_comparison.result.request_summary.quantity})</td>
+                  <td className="bg-[#F7F8FA] px-4 py-2.5 font-medium text-[#526170]">{isFr ? "Sous-total HT" : "Item subtotal"} (×{workspace.latest_comparison.result.request_summary.quantity})</td>
                   {workspace.latest_comparison.result.offers.map((o) => (
                     <td key={o.quotation_id} className="border-l border-[#DEE4E9] px-4 py-2.5">{o.currency_code} {o.item_subtotal}</td>
                   ))}
                 </tr>
                 <tr>
-                  <td className="bg-[#F7F8FA] px-4 py-2.5 font-medium text-[#526170]">Freight</td>
+                  <td className="bg-[#F7F8FA] px-4 py-2.5 font-medium text-[#526170]">{isFr ? "Frais de transport" : "Freight"}</td>
                   {workspace.latest_comparison.result.offers.map((o) => (
-                    <td key={o.quotation_id} className="border-l border-[#DEE4E9] px-4 py-2.5">{o.freight_amount !== null ? `${o.currency_code} ${o.freight_amount}` : <span className="text-[#9A5B13]">Unknown</span>}</td>
+                    <td key={o.quotation_id} className="border-l border-[#DEE4E9] px-4 py-2.5">{o.freight_amount !== null ? `${o.currency_code} ${o.freight_amount}` : <span className="text-[#9A5B13]">{isFr ? "Inconnu" : "Unknown"}</span>}</td>
                   ))}
                 </tr>
                 <tr>
-                  <td className="bg-[#F7F8FA] px-4 py-2.5 font-medium text-[#526170]">Quoted tax / TVA</td>
+                  <td className="bg-[#F7F8FA] px-4 py-2.5 font-medium text-[#526170]">{isFr ? "TVA / Taxes" : "Quoted tax / TVA"}</td>
                   {workspace.latest_comparison.result.offers.map((o) => (
-                    <td key={o.quotation_id} className="border-l border-[#DEE4E9] px-4 py-2.5">{o.quoted_tax_amount !== null ? `${o.currency_code} ${o.quoted_tax_amount}` : <span className="text-[#9A5B13]">Unknown</span>}</td>
+                    <td key={o.quotation_id} className="border-l border-[#DEE4E9] px-4 py-2.5">{o.quoted_tax_amount !== null ? `${o.currency_code} ${o.quoted_tax_amount}` : <span className="text-[#9A5B13]">{isFr ? "Inconnue" : "Unknown"}</span>}</td>
                   ))}
                 </tr>
+                {workspace.latest_comparison.result.request_summary.apply_fiscal_stamp && (
+                  <tr>
+                    <td className="bg-[#F7F8FA] px-4 py-2.5 font-medium text-[#526170]">{isFr ? "Timbre fiscal" : "Fiscal stamp (Timbre)"}</td>
+                    {workspace.latest_comparison.result.offers.map((o) => (
+                      <td key={o.quotation_id} className="border-l border-[#DEE4E9] px-4 py-2.5">
+                        {o.currency_code} {o.fiscal_stamp_amount ?? "1.000"}
+                      </td>
+                    ))}
+                  </tr>
+                )}
                 <tr className="bg-[#F7F8FA]/80 font-semibold">
-                  <td className="px-4 py-3">Total quoted cost</td>
+                  <td className="px-4 py-3">{isFr ? "Coût total TTC" : "Total quoted cost"}</td>
                   {workspace.latest_comparison.result.offers.map((o) => (
-                    <td key={o.quotation_id} className="border-l border-[#DEE4E9] px-4 py-3 text-sm">{o.total_quoted_cost !== null ? `${o.currency_code} ${o.total_quoted_cost}` : <span className="text-[#9A5B13]">Incomplete</span>}</td>
+                    <td key={o.quotation_id} className="border-l border-[#DEE4E9] px-4 py-3 text-sm">{o.total_quoted_cost !== null ? `${o.currency_code} ${o.total_quoted_cost}` : <span className="text-[#9A5B13]">{isFr ? "Incomplet" : "Incomplete"}</span>}</td>
                   ))}
                 </tr>
                 <tr>
-                  <td className="bg-[#F7F8FA] px-4 py-2.5 font-medium text-[#526170]">Delivery</td>
+                  <td className="bg-[#F7F8FA] px-4 py-2.5 font-medium text-[#526170]">{isFr ? "Délai de livraison" : "Delivery"}</td>
                   {workspace.latest_comparison.result.offers.map((o) => (
-                    <td key={o.quotation_id} className="border-l border-[#DEE4E9] px-4 py-2.5">{o.delivery_days != null ? `${o.delivery_days} days` : "Unknown"}</td>
+                    <td key={o.quotation_id} className="border-l border-[#DEE4E9] px-4 py-2.5">{o.delivery_days != null ? `${o.delivery_days} ${isFr ? "jours" : "days"}` : (isFr ? "Inconnu" : "Unknown")}</td>
                   ))}
                 </tr>
                 <tr>
                   <td className="bg-[#F7F8FA] px-4 py-2.5 align-top font-medium text-[#526170]">
-                    <div>Mandatory specs</div>
-                    <div className="mt-0.5 text-[10px] font-normal text-[#285447]">Jev Router verified</div>
+                    <div>{isFr ? "Spécifications obligatoires" : "Mandatory specs"}</div>
+                    <div className="mt-0.5 text-[10px] font-normal text-[#285447]">{isFr ? "Vérifié par Jev Router" : "Jev Router verified"}</div>
                   </td>
                   {workspace.latest_comparison.result.offers.map((o) => {
                     const sv = o.spec_verification;
@@ -1753,6 +1894,15 @@ export default function CaseFlowView({
                     Supplier: <strong>{workspace.purchase_order.supplier_name}</strong> · Total: <strong>{workspace.purchase_order.currency_code} {workspace.purchase_order.total_amount}</strong>
                   </p>
                 </div>
+                {workspace.purchase_order.has_pdf && (
+                  <button
+                    type="button"
+                    onClick={() => setPreview({ url: `/api/v1/purchase-orders/${workspace.purchase_order!.id}/pdf?inline=1`, title: workspace.purchase_order!.po_number || "PO" })}
+                    className="rounded-md border border-[#285447] bg-[#EDF4F1] px-3 py-2.5 text-sm font-medium text-[#285447]"
+                  >
+                    {t(lang, "previewPdf")}
+                  </button>
+                )}
                 {workspace.purchase_order.has_pdf && (
                   <a href={`/api/v1/purchase-orders/${workspace.purchase_order.id}/pdf`} className="inline-flex items-center gap-2 rounded-md bg-[#285447] px-4 py-2.5 text-sm font-medium text-white">
                     <Download className="h-4 w-4" />

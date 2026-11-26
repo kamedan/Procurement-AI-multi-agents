@@ -18,6 +18,8 @@ skills-lock.json
 PROCUREAI_MASTER_PLAN.md
 AGENTS.md
 GLOSSARY.md
+README.md
+.github/
 
 # Build & runtime caches
 **/node_modules
